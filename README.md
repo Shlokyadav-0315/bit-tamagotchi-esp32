@@ -70,4 +70,4 @@ Display backlight (BLK) and VCC → 3.3V. Servo power → separate external supp
 ## Credits
 
 - Original concept, Pico/Mac implementation, and base pixel art: [motino101](https://github.com/motino101/tamagotchi_hard_drive)
-- ESP32/Windows port, new features, and additional art: [your name here]
+- ESP32/Windows port, new features, and additional art: [Shlokyadav-0315]
