@@ -20,7 +20,40 @@ OFFSET CONFIG:
   BAR_Y_OFFSET  negative = bar up,        positive = bar down
 
 --------------------------------------------------------------------
-
+CHANGES FOR ESP32 + ST7735 (vs. original Pico/RP2040 + SSD1351):
+  1. @micropython.viper decorators REMOVED. Stock ESP32 MicroPython
+     builds do not support the viper/native code emitter (RP2040
+     does). The decorated functions have been rewritten as plain
+     Python. They're only ever called if you turn on COLOR_INVERT /
+     COLOR_SWAP_RB / COLOR_TINT below -- off by default, so no
+     runtime cost unless you enable them (and if you do, expect
+     them to be noticeably slower than on the Pico).
+  2. SPI pins changed to ESP32 GPIOs (VSPI bus, id=2). Pico GPIO
+     numbers (18/19/22/21/26) do NOT map to the same physical pins
+     or roles on ESP32 -- rewire per the table below.
+  3. Animation files are now opened from "art/<name>.bin" to match
+     the folder structure the README tells you to upload (the
+     original code looked for them with no folder prefix, which
+     wouldn't have worked on either board).
+  4. init_display() and set_window() REWRITTEN for the ST7735
+     controller. The original commands (0xFD unlock, 0xB3 clock
+     div, 0xCA mux ratio, 0x15/0x75/0x5C column/row/writeram, ...)
+     are SSD1351 register addresses -- an ST7735 doesn't have those
+     registers and would never initialize with them. ST7735 uses
+     an entirely different, better-documented command set (0x11
+     sleep-out, 0x3A pixel format, 0x36 MADCTL, 0x2A/0x2B/0x2C
+     column/row/write). This version sends the correct sequence.
+  5. Added PANEL_X_OFFSET / PANEL_Y_OFFSET (see below) -- most
+     128x128 ST7735 boards need a small offset because the
+     controller's internal RAM is actually 132x162 or 128x160 and
+     your visible glass is a cropped window into it. Wrong offset
+     shows up as a colored line/band on one edge, or the image
+     shifted a couple pixels. Tune it after first boot.
+  6. ST7735 is a backlit TFT (not a self-emitting OLED like the
+     SSD1351) -- it has an LED/BLK backlight pin that MUST be tied
+     to 3.3V (or driven high) or the screen will stay black even
+     though everything else is working. See wiring table.
+--------------------------------------------------------------------
 
 ESP32 WIRING for a 1.44" 128x128 ST7735 module (8-pin: GND, VCC,
 SCL/SCK, SDA/DIN/MOSI, RES/RST, DC/A0, CS, BLK/LED):
@@ -64,6 +97,7 @@ import sys
 import uselect
 
 
+
 # --- CONFIGURATION ---
 WIDTH      = 128
 HEIGHT     = 128
@@ -93,7 +127,25 @@ BAR_Y_OFFSET = 2   # negative = move bar up, positive = move bar down
 # -------------------------------------------------------
 
 # -------------------------------------------------------
-
+# RUNTIME COLOR REMAP
+# Tweak these and reset the board - no .bin re-encoding needed.
+# NOTE: on ESP32 these run in plain Python (no viper), so they are
+# slower than on the Pico -- watch actual frame rate once enabled;
+# lower TARGET_FPS below if it looks laggy.
+#
+# RECOLOR_STYLE selects which recolor to apply. Options:
+#   None         - no recoloring, art plays as originally drawn
+#   'pink_body'  - selective recolor: true black stays black,
+#                  red-dominant pixels (the body) -> PINK_COLOR,
+#                  green-dominant pixels (the leaf) -> LEAF_COLOR.
+#                  Shading/highlights are preserved, not flattened.
+#                  This is the finalized look.
+#   'tint'       - simple blanket blend toward COLOR_TINT (also
+#                  tints the background, unlike 'pink_body') --
+#                  kept here for future experimentation.
+#   Colors are now BAKED DIRECTLY into the .bin files (see the
+#   lag-fix notes below), so this stays None for normal use --
+#   only switch it back if you swap in un-recolored original art.
 RECOLOR_STYLE = None
 
 # --- 'pink_body' settings ---
@@ -146,7 +198,14 @@ BUTTON_PIN  = 14
 i2c = I2C(0, scl=Pin(I2C_SCL_PIN), sda=Pin(I2C_SDA_PIN), freq=400000)
 MPU_ADDR = 0x68
 
-
+# Wake the MPU6050 up (power management register). Wrapped in
+# try/except: if the gyro has any wiring issue (loose breadboard
+# wire, wrong pin, bad connection -- all common on a first build),
+# this used to throw an unhandled exception here and crash the
+# WHOLE script before the display even turned on. Now a bad gyro
+# connection just disables shake detection -- the screen/animations
+# keep working fine regardless, same graceful pattern as the
+# missing-bar.bin handling below.
 _MPU_OK = False
 try:
     i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')
@@ -178,6 +237,7 @@ button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
 _press_start = None
 LONG_PRESS_MS = 3000
 asleep = False
+_pre_sleep_base = 'idle'   # base_state to restore when waking up
 
 # --- HELPER FUNCTIONS ---
 def cmd(c):
@@ -261,7 +321,7 @@ def init_display():
 
     cmd(0x20)                 # INVOFF - display inversion off
 
-    cmd(0x36); data(b'\xC0')              # MADCTL - memory access control
+    cmd(0x36); data(b'\xC8')              # MADCTL - memory access control
                                            # (orientation/RGB order; try 0xC8 if
                                            # colors are swapped)
 
@@ -332,46 +392,32 @@ def _pack565(r, g, b):
 # One color + fill level per base state -- matches the pink/black/
 # green palette already baked into the animations. Tweak freely.
 BAR_COLORS = {
-    'hangry': (220, 90, 60),     # warm red/orange -- low, urgent
-    'idle':   (255, 105, 180),   # pink -- matches the body color
-    'chonk':  (70, 200, 90),     # green -- matches the leaf, "full"
+    'hangry':   (220, 90, 60),     # warm red/orange -- low, urgent
+    'idle':     (255, 105, 180),   # pink -- matches the body color
+    'chonk':    (70, 200, 90),     # green -- matches the leaf, "full"
+    'sleeping': (90, 90, 160),     # dim blue/purple -- calm/resting
 }
 BAR_FILL_PCT = {
-    'hangry': 0.20,
-    'idle':   0.60,
-    'chonk':  1.00,
+    'hangry':   0.20,
+    'idle':     0.60,
+    'chonk':    1.00,
+    'sleeping': 0.60,
 }
 BAR_BORDER_COLOR = (70, 70, 70)   # dim grey outline so it reads as
                                    # a container even when nearly empty
 BAR_BORDER_PX = 1
 
 def composite_bar():
-    """Draw a live mood bar into the reserved band at the bottom of
-    the screen. Color and fill level follow base_state -- this is
-    computed fresh every frame (cheap: it's just row-length byte
-    fills, not a per-pixel loop), so it's always in sync with
-    whatever's currently happening, no separate art file required."""
+    """Load pre-rendered pixel-art bar directly from bar.bin file."""
     if rows_visible <= 0:
         return
 
-    color = BAR_COLORS.get(base_state, (255, 105, 180))
-    pct   = BAR_FILL_PCT.get(base_state, 0.5)
-
-    fill_px   = _pack565(*color)
-    border_px = _pack565(*BAR_BORDER_COLOR)
-    black_px  = _pack565(0, 0, 0)
-
-    inner_width = WIDTH - 2 * BAR_BORDER_PX
-    fill_width  = int(inner_width * pct)
-    black_width = inner_width - fill_width
-
-    border_row = border_px * WIDTH
-    fill_row   = border_px + fill_px * fill_width + black_px * black_width + border_px
-
-    for r in range(rows_visible):
-        row_off = bar_byte_start + r * ROW_BYTES
-        is_border_row = (r < BAR_BORDER_PX) or (r >= rows_visible - BAR_BORDER_PX)
-        mv_frame[row_off:row_off + ROW_BYTES] = border_row if is_border_row else fill_row
+    try:
+        with open("art/bar.bin", "rb") as f:
+            bar_bytes = f.read(rows_visible * WIDTH * 2)
+            mv_frame[bar_byte_start:bar_byte_start + len(bar_bytes)] = bar_bytes
+    except Exception as e:
+        pass
 
 
 # --- RUNTIME COLOR TRANSFORMS (plain Python -- ESP32 has no viper) ---
@@ -532,9 +578,10 @@ def check_shake():
 # --- LED (plain LED, brightness/blink patterns instead of color) ---
 # (pattern, brightness_pct) per state. Edit these to taste.
 LED_PATTERNS = {
-    'idle':   ('solid',      50),
-    'hangry': ('blink_slow', 100),
-    'chonk':  ('solid',      100),
+    'idle':     ('solid',      50),
+    'hangry':   ('blink_slow', 100),
+    'chonk':    ('solid',      100),
+    'sleeping': ('off',        0),
 }
 TRANSIENT_LED_PATTERNS = {
     'eating':      ('flash',      100),
@@ -575,7 +622,7 @@ def tick_led():
 
 
 # --- SERVO (eased, non-blocking) ---
-STATE_ANGLES = {'idle': 90, 'hangry': 60, 'chonk': 120}
+STATE_ANGLES = {'idle': 90, 'hangry': 60, 'chonk': 120, 'sleeping': 90}
 TRANSIENT_ANGLES = {'eating': 100, 'sad': 45, 'getup': 90,
                      'grow': 90, 'hangry_once': 60}
 
@@ -662,9 +709,10 @@ _ZERO_ROW = bytes(ROW_BYTES)
 # the README upload instructions. Rename here if yours differ.
 ART_DIR = "art/"
 BASE_FILES = {
-    'idle':   ART_DIR + "character_anim.bin",
-    'hangry': ART_DIR + "hangry_anim.bin",
-    'chonk':  ART_DIR + "chonk_anim.bin",
+    'idle':     ART_DIR + "character_anim.bin",
+    'hangry':   ART_DIR + "hangry_anim.bin",
+    'chonk':    ART_DIR + "chonk_anim.bin",
+    'sleeping': ART_DIR + "sleeping_anim.bin",
 }
 TRANSIENT_FILES = {
     'eating':      ART_DIR + "eating_anim.bin",
@@ -788,17 +836,26 @@ try:
         press = check_button()
         if press == 'short' and not asleep:
             start_transient('eating')
-
-        # Sleep mode: freeze LED/servo/animation, just keep polling the
-        # button so a long press can wake it back up.
-        if asleep:
-            led.duty_u16(0)
-            time.sleep_ms(FRAME_MS)
-            continue
+        elif press == 'long':
+            if asleep:
+                # Just fell asleep: remember whatever base we were in
+                # (idle/hangry/chonk) so we can restore it on wake, cancel
+                # any one-shot that was mid-play, then switch to the
+                # sleeping base state -- this routes through the normal
+                # state machine so it gets its own looping animation,
+                # LED pattern, servo angle and bar color for free.
+                _pre_sleep_base = base_state
+                transient_state = None
+                pending_base = None
+                set_base('sleeping')
+            else:
+                # Waking up: go back to whatever base we were in before.
+                set_base(_pre_sleep_base)
 
         # Shake: remap 'hangry_once' below to whichever transient you
-        # want a shake to trigger.
-        if check_shake():
+        # want a shake to trigger. Skipped while asleep so it can't
+        # interrupt the sleeping animation.
+        if not asleep and check_shake():
             start_transient('hangry_once')
 
         tick_led()
@@ -837,6 +894,7 @@ try:
 
         # 4) Composite bar on top
         composite_bar()
+         
 
         # 5) Draw full frame in one SPI transaction
         set_window()
