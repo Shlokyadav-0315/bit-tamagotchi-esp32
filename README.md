@@ -17,6 +17,8 @@ Bit is a small pixel-art pet living on a 128×128 display, driven by an ESP32. A
 - **Press the button** → short press feeds it, long press puts it to sleep (with its own custom sleep animation)
 
 All of this shows up on-screen as: the animated pet itself, a live color-coded **mood bar**, and temporary **pixel-art text popups** ("YUM!", "HANGRY!", etc.) that appear and fade on their own. A servo gives it physical movement, and an LED pulses like a heartbeat with a pattern that changes with its mood.
+
+
 <img width="179" height="320" alt="Screenshot 2026-09-25 100442" src="https://github.com/user-attachments/assets/63346d1b-9f96-479b-9c8a-2773ee1760c1" />
 
 ## Hardware
